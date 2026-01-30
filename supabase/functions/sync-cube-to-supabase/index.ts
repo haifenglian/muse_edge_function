@@ -235,7 +235,7 @@ Deno.serve(async (req: Request) => {
       const productId = String(rawId);
       products.push(rowToProduct(row));
       let resaved = parseResavedImagePath(get(row, "resaved_image_path"));
-      if (resaved.length === 0) resaved = [`https://example.com/placeholder/${productId}.jpg`];
+      if (resaved.length === 0) resaved = [`https://storage.googleapis.com/material_management_system/image/processed_image_20260119_081137_9334c2ef.jpg`];
       const dimsStr = (get(row, "dimensions_str") != null && typeof get(row, "dimensions_str") === "string")
         ? (get(row, "dimensions_str") as string)
         : "{}";
