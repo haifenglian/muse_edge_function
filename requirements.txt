@@ -1,0 +1,4 @@
+# Cube API + 阶段一同步（仅用 requests 调 Supabase REST API，兼容 Python 3.14）
+PyJWT>=2.0.0
+requests>=2.28.0
+urllib3>=2.0.0
