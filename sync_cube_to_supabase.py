@@ -200,7 +200,7 @@ def run_sync(
         products.append(product)
         resaved = _parse_resaved_image_path(_get(row, "resaved_image_path"))
         if not resaved:
-            resaved = [f"https://example.com/placeholder/{product_id}.jpg"]
+            resaved = ["https://storage.googleapis.com/material_management_system/image/processed_image_20260119_081137_9334c2ef.jpg"]
         dims_str = _get(row, "dimensions_str")
         if dims_str is None:
             dims_str = "{}"
