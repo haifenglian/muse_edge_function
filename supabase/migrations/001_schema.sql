@@ -46,14 +46,14 @@ COMMENT ON COLUMN public.aliyun_sync_tasks.processing_started_at IS '消费者�
 COMMENT ON COLUMN public.aliyun_sync_tasks.synced_at IS '成功入阿里云图库的时间';
 COMMENT ON COLUMN public.aliyun_sync_tasks.completed_at IS '任务结束时间（成功或失败）';
 
--- 3. 增量同步游标表（存上次同步到的 ingested_at）
+-- 3. 增量同步游标表（存上次同步到的 analyzed_at）
 CREATE TABLE IF NOT EXISTS public.sync_state (
   key text PRIMARY KEY,
   value text,
   updated_at timestamptz DEFAULT now()
 );
 
-COMMENT ON TABLE public.sync_state IS '同步游标，key=cube_last_ingested_at 时 value 为上次同步的最大 ingested_at（ISO 字符串）';
+COMMENT ON TABLE public.sync_state IS '同步游标，key=cube_last_analyzed_at 时 value 为上次同步的最大 analyzed_at（ISO 字符串）';
 
 -- 可选：updated_at 自动更新
 -- CREATE OR REPLACE FUNCTION public.set_updated_at()

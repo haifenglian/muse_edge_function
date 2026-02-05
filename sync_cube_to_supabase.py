@@ -2,8 +2,8 @@
 阶段一：从 Cube dws_standard_products_tag_view 增量拉取数据，
 写入 Supabase 产品表，并按 resaved_image_path 展开写入阿里云同步任务表。
 
-增量逻辑：从 sync_state 表读取上次同步的 last_ingested_at，只拉 ingested_at > last_ingested_at；
-首次运行无游标时做全量拉取，拉完后写入本批 max(ingested_at) 到 sync_state。
+增量逻辑：从 sync_state 表读取上次同步的 last_analyzed_at，只拉 analyzed_at > last_analyzed_at；
+首次运行无游标时做全量拉取，拉完后写入本批 max(analyzed_at) 到 sync_state。
 
 环境变量：
   SUPABASE_URL          Supabase 项目 URL
@@ -77,25 +77,21 @@ def _get(row: JsonDict, key: str) -> Any:
     return v
 
 
-def _parse_resaved_image_path(v: Any) -> List[str]:
-    """将 resaved_image_path 转为 URL 字符串列表。"""
+def _parse_stored_url(v: Any) -> List[str]:
+    """stored_url 为字符串类型 URL，转为 [url] 以兼容下游。"""
     if v is None:
         return []
+    if isinstance(v, str) and v.strip():
+        return [v.strip()]
     if isinstance(v, list):
-        return [str(x) for x in v]
-    if isinstance(v, str):
-        try:
-            arr = json.loads(v)
-            return [str(x) for x in arr] if isinstance(arr, list) else []
-        except (json.JSONDecodeError, TypeError):
-            return []
+        return [str(x) for x in v if x]
     return []
 
 
 def _row_to_product(row: JsonDict) -> JsonDict:
     """将 Cube 返回的一行转为产品表一行（列名无前缀），dimensions_str 不允许 null。"""
     raw_id = _get(row, "id")
-    resaved = _get(row, "resaved_image_path")
+    stored_url = _get(row, "stored_url")
     raw_cat = _get(row, "category_id")
     if raw_cat is not None and isinstance(raw_cat, (int, float)) and not math.isnan(raw_cat):
         category_id = int(raw_cat)
@@ -115,7 +111,7 @@ def _row_to_product(row: JsonDict) -> JsonDict:
         "category_tagged_time": _get(row, "category_tagged_time"),
         "dimensions_tagged_time": _get(row, "dimensions_tagged_time"),
         "ingested_at": _get(row, "ingested_at"),
-        "resaved_image_path": _parse_resaved_image_path(resaved) if resaved is not None else [],
+        "resaved_image_path": _parse_stored_url(stored_url) if stored_url is not None else [],
     }
 
 
@@ -153,7 +149,7 @@ def run_sync(
     cfg = CubeConfig(base_url=cube_base, api_secret=cube_secret, token_ttl_seconds=3600, timeout_seconds=60)
     client = CubeClient(cfg)
 
-    cursor_key = "cube_last_ingested_at"
+    cursor_key = "cube_last_analyzed_at"
     try:
         data = _supabase_rest(
             supabase_url,
@@ -163,11 +159,11 @@ def run_sync(
             params={"key": f"eq.{cursor_key}", "select": "value"},
             prefer="return=representation",
         )
-        last_ingested_at = data[0]["value"] if data else None
+        last_analyzed_at = data[0]["value"] if data else None
     except Exception:
-        last_ingested_at = None
-    if last_ingested_at:
-        print(f"增量同步：ingested_at > {last_ingested_at}")
+        last_analyzed_at = None
+    if last_analyzed_at:
+        print(f"增量同步：analyzed_at > {last_analyzed_at}")
     else:
         print("首次同步（全量）")
 
@@ -175,7 +171,7 @@ def run_sync(
     try:
         rows = fetch_view_incremental(
             client,
-            since_ingested_at=last_ingested_at,
+            since_analyzed_at=last_analyzed_at,
             page_size=page_size,
             max_rows=max_rows,
         )
@@ -195,16 +191,16 @@ def run_sync(
         raw_id = _get(row, "id")
         if raw_id is None:
             continue
+        urls = _parse_stored_url(_get(row, "stored_url"))
+        if not urls:
+            continue  # 仅同步有 stored_url 的产品
         product_id = str(raw_id)
         product = _row_to_product(row)
         products.append(product)
-        resaved = _parse_resaved_image_path(_get(row, "resaved_image_path"))
-        if not resaved:
-            resaved = ["https://storage.googleapis.com/material_management_system/image/processed_image_20260119_081137_9334c2ef.jpg"]
         dims_str = _get(row, "dimensions_str")
         if dims_str is None:
             dims_str = "{}"
-        all_tasks.extend(_expand_tasks(product_id, dims_str, resaved))
+        all_tasks.extend(_expand_tasks(product_id, dims_str, urls))
 
     for i in range(0, len(products), batch_size):
         batch = products[i : i + batch_size]
@@ -241,9 +237,9 @@ def run_sync(
             else:
                 print(f"  任务插入失败 {t.get('product_id')} {t.get('pic_name')}: {e}", file=sys.stderr)
 
-    ingested_values = [_get(row, "ingested_at") for row in rows]
-    ingested_values = [v for v in ingested_values if v is not None]
-    new_cursor = max(ingested_values) if ingested_values else last_ingested_at
+    analyzed_values = [_get(row, "analyzed_at") for row in rows]
+    analyzed_values = [v for v in analyzed_values if v is not None]
+    new_cursor = max(analyzed_values) if analyzed_values else last_analyzed_at
     if new_cursor:
         _supabase_rest(
             supabase_url,
@@ -253,7 +249,7 @@ def run_sync(
             json_body={"key": cursor_key, "value": new_cursor, "updated_at": datetime.now(tz=timezone.utc).isoformat()},
             prefer="resolution=merge-duplicates,return=minimal",
         )
-        print(f"游标已更新: cube_last_ingested_at = {new_cursor}")
+        print(f"游标已更新: cube_last_analyzed_at = {new_cursor}")
 
     print(f"产品表: {len(products)} 条; 任务表: 新增 {inserted} 条（共 {len(all_tasks)} 条待处理）")
     print("阶段一完成。")

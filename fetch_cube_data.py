@@ -439,7 +439,8 @@ VIEW_DIMENSIONS = [
     "dws_standard_products_tag_view.category_tagged_time",
     "dws_standard_products_tag_view.dimensions_tagged_time",
     "dws_standard_products_tag_view.ingested_at",
-    # "dws_standard_products_tag_view.resaved_image_path",  # view 暂无，同步时用 mock []
+    "dws_standard_products_tag_view.analyzed_at",
+    "dws_standard_products_tag_view.stored_url",
 ]
 
 
@@ -489,14 +490,14 @@ def fetch_view_all(
 def fetch_view_incremental(
     client: CubeClient,
     *,
-    since_ingested_at: Optional[str] = None,
+    since_analyzed_at: Optional[str] = None,
     page_size: int = 5000,
     max_rows: Optional[int] = None,
 ) -> List[JsonDict]:
     """
-    从 dws_standard_products_tag_view 增量拉取（ingested_at > since_ingested_at）。
-    since_ingested_at 为 None 时等价于全量拉取（首次同步）。
-    返回 data 列表；建议按 ingested_at 升序，便于用本批 max(ingested_at) 更新游标。
+    从 dws_standard_products_tag_view 增量拉取（analyzed_at > since_analyzed_at）。
+    since_analyzed_at 为 None 时等价于全量拉取（首次同步）。
+    返回 data 列表；建议按 analyzed_at 升序，便于用本批 max(analyzed_at) 更新游标。
     """
     cube_name = "dws_standard_products_tag_view"
     all_data: List[JsonDict] = []
@@ -512,17 +513,18 @@ def fetch_view_incremental(
             "limit": limit_this_page,
             "offset": offset,
             "timezone": "UTC",
-            "order": {f"{cube_name}.ingested_at": "asc"},
+            "order": {f"{cube_name}.analyzed_at": "asc"},
         }
-        # 只拉 dimensions_str 非空的数据
+        # 只拉 dimensions_str、stored_url 非空的数据
         query["filters"] = [
             {"member": f"{cube_name}.dimensions_str", "operator": "set"},
+            {"member": f"{cube_name}.stored_url", "operator": "set"},
         ]
-        if since_ingested_at:
+        if since_analyzed_at:
             query["filters"].append({
-                "member": f"{cube_name}.ingested_at",
+                "member": f"{cube_name}.analyzed_at",
                 "operator": "gt",
-                "values": [since_ingested_at],
+                "values": [since_analyzed_at],
             })
 
         result = client.load(query)

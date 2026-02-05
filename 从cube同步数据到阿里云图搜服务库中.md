@@ -10,8 +10,8 @@
 1. **建表**：在 Supabase SQL Editor 中执行 [supabase/migrations/001_schema.sql](supabase/migrations/001_schema.sql)，创建 `standard_products_tag`（产品表）、`aliyun_sync_tasks`（阿里云同步任务表）、`sync_state`（增量游标表）。
 2. **环境变量**：设置 `SUPABASE_URL`、`SUPABASE_SERVICE_ROLE_KEY`（或 `SUPABASE_KEY`）。可选：`CUBE_PAGE_SIZE`（默认 5000）、`CUBE_MAX_ROWS`（单次最多拉取条数，不设则拉完本批增量）。
 3. **运行同步**：`pip install -r requirements.txt` 后执行 `python sync_cube_to_supabase.py`。
-   - **首次运行**：无游标，从 Cube **全量**拉取，写入产品表与任务表，并将本批最大 `ingested_at` 写入 `sync_state`（key=`cube_last_ingested_at`）。
-   - **后续运行**：读取 `sync_state` 中的 `cube_last_ingested_at`，只拉 **ingested_at > 游标** 的数据，拉完后更新游标。产品表 upsert、任务表仅插入新任务（重复跳过）。
+   - **首次运行**：无游标，从 Cube **全量**拉取，写入产品表与任务表，并将本批最大 `analyzed_at` 写入 `sync_state`（key=`cube_last_analyzed_at`）。
+   - **后续运行**：读取 `sync_state` 中的 `cube_last_analyzed_at`，只拉 **analyzed_at > 游标** 的数据，拉完后更新游标。产品表 upsert、任务表仅插入新任务（重复跳过）。
 4. **定时**：可用 cron 或 Supabase Edge Function 定时每 5～15 分钟执行一次。
 
 ## cube 参考文档

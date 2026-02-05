@@ -8,7 +8,7 @@
  *
  * 接口：
  *   GET  /functions/v1/sync-cube-to-supabase
- *        返回当前同步状态（last_ingested_at），不执行同步。
+ *        返回当前同步状态（last_analyzed_at），不执行同步。
  *   POST /functions/v1/sync-cube-to-supabase
  *        触发一次增量同步。可选查询参数：?page_size=5000&max_rows=10000
  *        覆盖环境变量，用于单次限流或测试。
@@ -25,6 +25,8 @@ const VIEW_DIMENSIONS = [
   `${CUBE_VIEW}.category_tagged_time`,
   `${CUBE_VIEW}.dimensions_tagged_time`,
   `${CUBE_VIEW}.ingested_at`,
+  `${CUBE_VIEW}.analyzed_at`,
+  `${CUBE_VIEW}.stored_url`,
 ];
 
 const CORS_HEADERS = {
@@ -37,23 +39,17 @@ function get(row: Record<string, unknown>, key: string): unknown {
   return row[PREFIX + key] ?? row[key];
 }
 
-function parseResavedImagePath(v: unknown): string[] {
+/** stored_url 为字符串类型 URL，转为 [url] 以兼容下游（产品表 resaved_image_path 为数组） */
+function parseStoredUrl(v: unknown): string[] {
   if (v == null) return [];
-  if (Array.isArray(v)) return v.map((x) => String(x));
-  if (typeof v === "string") {
-    try {
-      const arr = JSON.parse(v);
-      return Array.isArray(arr) ? arr.map((x: unknown) => String(x)) : [];
-    } catch {
-      return [];
-    }
-  }
+  if (typeof v === "string" && v.trim()) return [v.trim()];
+  if (Array.isArray(v)) return v.map((x) => String(x)).filter((s) => s?.trim());
   return [];
 }
 
 function rowToProduct(row: Record<string, unknown>): Record<string, unknown> {
   const rawId = get(row, "id");
-  const resaved = get(row, "resaved_image_path");
+  const storedUrl = get(row, "stored_url");
   const rawCat = get(row, "category_id");
   let categoryId: number | null = null;
   if (typeof rawCat === "number" && !Number.isNaN(rawCat)) categoryId = Math.floor(rawCat);
@@ -67,7 +63,7 @@ function rowToProduct(row: Record<string, unknown>): Record<string, unknown> {
     category_tagged_time: get(row, "category_tagged_time"),
     dimensions_tagged_time: get(row, "dimensions_tagged_time"),
     ingested_at: get(row, "ingested_at"),
-    resaved_image_path: parseResavedImagePath(resaved),
+    resaved_image_path: parseStoredUrl(storedUrl),
   };
 }
 
@@ -113,7 +109,7 @@ async function makeCubeToken(secret: string, ttlSeconds = 3600): Promise<string>
 async function fetchCubeIncremental(
   baseUrl: string,
   token: string,
-  sinceIngestedAt: string | null,
+  sinceAnalyzedAt: string | null,
   pageSize: number,
   maxRows: number | null
 ): Promise<Record<string, unknown>[]> {
@@ -132,14 +128,17 @@ async function fetchCubeIncremental(
       limit,
       offset,
       timezone: "UTC",
-      order: { [`${CUBE_VIEW}.ingested_at`]: "asc" },
-      filters: [{ member: `${CUBE_VIEW}.dimensions_str`, operator: "set" }],
+      order: { [`${CUBE_VIEW}.analyzed_at`]: "asc" },
+      filters: [
+        { member: `${CUBE_VIEW}.dimensions_str`, operator: "set" },
+        { member: `${CUBE_VIEW}.stored_url`, operator: "set" },
+      ],
     };
-    if (sinceIngestedAt) {
+    if (sinceAnalyzedAt) {
       (query.filters as Record<string, unknown>[]).push({
-        member: `${CUBE_VIEW}.ingested_at`,
+        member: `${CUBE_VIEW}.analyzed_at`,
         operator: "gt",
-        values: [sinceIngestedAt],
+        values: [sinceAnalyzedAt],
       });
     }
     const res = await fetch(url, {
@@ -183,17 +182,17 @@ Deno.serve(async (req: Request) => {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
-    const cursorKey = "cube_last_ingested_at";
+    const cursorKey = "cube_last_analyzed_at";
     const { data: cursorRows } = await supabase.from("sync_state").select("value").eq("key", cursorKey).limit(1);
-    const lastIngestedAt = (cursorRows?.[0]?.value as string | null) ?? null;
+    const lastAnalyzedAt = (cursorRows?.[0]?.value as string | null) ?? null;
 
     // GET：仅返回同步状态，不执行同步
     if (req.method === "GET") {
-      console.log("[sync-cube] GET: last_ingested_at =", lastIngestedAt ?? "(none)");
+      console.log("[sync-cube] GET: last_analyzed_at =", lastAnalyzedAt ?? "(none)");
       return jsonResponse({
         ok: true,
         cursor_key: cursorKey,
-        last_ingested_at: lastIngestedAt,
+        last_analyzed_at: lastAnalyzedAt,
         message: "使用 POST 触发一次增量同步。",
       });
     }
@@ -213,9 +212,9 @@ Deno.serve(async (req: Request) => {
     const cubeBase = Deno.env.get("CUBE_BASE_URL") ?? "https://combative-keene.gcp-us-central1.cubecloudapp.dev/cubejs-api/v1";
     const cubeSecret = Deno.env.get("CUBE_API_SECRET") ?? "032dcfacaccab8449281b8c6351ec58844c1179630392a34d2adc40aa420b061";
     const token = await makeCubeToken(cubeSecret);
-    console.log("[sync-cube] POST: sync started, last_ingested_at =", lastIngestedAt ?? "(full)", "page_size =", pageSize, "max_rows =", maxRows ?? "none");
+    console.log("[sync-cube] POST: sync started, last_analyzed_at =", lastAnalyzedAt ?? "(full)", "page_size =", pageSize, "max_rows =", maxRows ?? "none");
 
-    const rows = await fetchCubeIncremental(cubeBase, token, lastIngestedAt, pageSize, maxRows);
+    const rows = await fetchCubeIncremental(cubeBase, token, lastAnalyzedAt, pageSize, maxRows);
     if (rows.length === 0) {
       console.log("[sync-cube] no new data from Cube");
       return jsonResponse({
@@ -223,7 +222,7 @@ Deno.serve(async (req: Request) => {
         message: "本批无新数据",
         products: 0,
         tasksInserted: 0,
-        last_ingested_at: lastIngestedAt,
+        last_analyzed_at: lastAnalyzedAt,
       });
     }
 
@@ -232,14 +231,14 @@ Deno.serve(async (req: Request) => {
     for (const row of rows) {
       const rawId = get(row, "id");
       if (rawId == null) continue;
+      const urls = parseStoredUrl(get(row, "stored_url"));
+      if (urls.length === 0) continue; // 仅同步有 stored_url 的产品
       const productId = String(rawId);
       products.push(rowToProduct(row));
-      let resaved = parseResavedImagePath(get(row, "resaved_image_path"));
-      if (resaved.length === 0) resaved = [`https://storage.googleapis.com/material_management_system/image/processed_image_20260119_081137_9334c2ef.jpg`];
       const dimsStr = (get(row, "dimensions_str") != null && typeof get(row, "dimensions_str") === "string")
         ? (get(row, "dimensions_str") as string)
         : "{}";
-      allTasks.push(...expandTasks(productId, dimsStr, resaved));
+      allTasks.push(...expandTasks(productId, dimsStr, urls));
     }
     console.log("[sync-cube] fetched from Cube: rows =", rows.length, "products =", products.length, "tasks =", allTasks.length);
 
@@ -258,8 +257,8 @@ Deno.serve(async (req: Request) => {
       } else inserted++;
     }
 
-    const ingestedValues = rows.map((r) => get(r, "ingested_at")).filter((v): v is string => typeof v === "string");
-    const newCursor = ingestedValues.length > 0 ? ingestedValues.sort().pop()! : lastIngestedAt;
+    const analyzedValues = rows.map((r) => get(r, "analyzed_at")).filter((v): v is string => typeof v === "string");
+    const newCursor = analyzedValues.length > 0 ? analyzedValues.sort().pop()! : lastAnalyzedAt;
     if (newCursor) {
       await supabase.from("sync_state").upsert(
         { key: cursorKey, value: newCursor, updated_at: new Date().toISOString() },
@@ -275,7 +274,7 @@ Deno.serve(async (req: Request) => {
       tasksInserted: inserted,
       tasksTotal: allTasks.length,
       cursor: newCursor,
-      last_ingested_at: newCursor,
+      last_analyzed_at: newCursor,
     });
   } catch (e) {
     console.error("[sync-cube] error:", e);
