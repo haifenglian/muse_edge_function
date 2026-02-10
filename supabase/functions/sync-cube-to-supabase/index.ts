@@ -69,6 +69,7 @@ function rowToProduct(row: Record<string, unknown>): Record<string, unknown> {
 
 function expandTasks(
   productId: string,
+  categoryId: number | null,
   dimensionsStr: string,
   resavedImagePath: string[]
 ): Array<Record<string, unknown>> {
@@ -77,6 +78,7 @@ function expandTasks(
     if (!url?.trim()) return;
     tasks.push({
       product_id: productId,
+      category_id: categoryId,
       pic_url: url.trim(),
       pic_name: `${productId}_${i}`,
       custom_content: dimensionsStr,
@@ -206,15 +208,22 @@ Deno.serve(async (req: Request) => {
     const pageSizeParam = url.searchParams.get("page_size");
     const maxRowsParam = url.searchParams.get("max_rows");
     const pageSize = pageSizeParam ? parseInt(pageSizeParam, 10) : parseInt(Deno.env.get("CUBE_PAGE_SIZE") ?? "5000", 10);
+    // 默认每次最多处理 500 条，可通过查询参数或环境变量覆盖
     const maxRowsEnv = maxRowsParam ?? Deno.env.get("CUBE_MAX_ROWS");
-    const maxRows = maxRowsEnv ? parseInt(String(maxRowsEnv), 10) : null;
+    const maxRows = maxRowsEnv ? parseInt(String(maxRowsEnv), 10) : 500;
 
     const cubeBase = Deno.env.get("CUBE_BASE_URL") ?? "https://combative-keene.gcp-us-central1.cubecloudapp.dev/cubejs-api/v1";
     const cubeSecret = Deno.env.get("CUBE_API_SECRET") ?? "032dcfacaccab8449281b8c6351ec58844c1179630392a34d2adc40aa420b061";
     const token = await makeCubeToken(cubeSecret);
-    console.log("[sync-cube] POST: sync started, last_analyzed_at =", lastAnalyzedAt ?? "(full)", "page_size =", pageSize, "max_rows =", maxRows ?? "none");
+    console.log("[sync-cube] ===== SYNC STARTED =====");
+    console.log("[sync-cube] POST: sync started");
+    console.log("[sync-cube] last_analyzed_at =", lastAnalyzedAt ?? "(full - first sync)");
+    console.log("[sync-cube] page_size =", pageSize);
+    console.log("[sync-cube] max_rows =", maxRows, "(default: 500)");
 
     const rows = await fetchCubeIncremental(cubeBase, token, lastAnalyzedAt, pageSize, maxRows);
+    console.log("[sync-cube] ===== FETCHED FROM CUBE =====");
+    console.log("[sync-cube] fetched rows count:", rows.length);
     if (rows.length === 0) {
       console.log("[sync-cube] no new data from Cube");
       return jsonResponse({
@@ -226,51 +235,135 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // 记录实际的最大 analyzed_at（用于更新游标）
+    const analyzedValues = rows.map((r) => get(r, "analyzed_at")).filter((v): v is string => typeof v === "string");
+    const tempMaxAnalyzedAt = analyzedValues.length > 0 ? analyzedValues.sort().pop()! : lastAnalyzedAt;
+    console.log("[sync-cube] max analyzed_at in this batch:", tempMaxAnalyzedAt ?? "(none)");
+
     const products: Record<string, unknown>[] = [];
     const allTasks: Array<Record<string, unknown>> = [];
+    let skippedNoId = 0;
+    let skippedNoUrl = 0;
+
     for (const row of rows) {
       const rawId = get(row, "id");
-      if (rawId == null) continue;
+      if (rawId == null) {
+        skippedNoId++;
+        continue;
+      }
       const urls = parseStoredUrl(get(row, "stored_url"));
-      if (urls.length === 0) continue; // 仅同步有 stored_url 的产品
+      if (urls.length === 0) {
+        skippedNoUrl++;
+        continue; // 仅同步有 stored_url 的产品
+      }
       const productId = String(rawId);
       products.push(rowToProduct(row));
+
+      // 提取 category_id
+      const rawCat = get(row, "category_id");
+      let categoryId: number | null = null;
+      if (typeof rawCat === "number" && !Number.isNaN(rawCat)) categoryId = Math.floor(rawCat);
+
       const dimsStr = (get(row, "dimensions_str") != null && typeof get(row, "dimensions_str") === "string")
         ? (get(row, "dimensions_str") as string)
         : "{}";
-      allTasks.push(...expandTasks(productId, dimsStr, urls));
+      allTasks.push(...expandTasks(productId, categoryId, dimsStr, urls));
     }
-    console.log("[sync-cube] fetched from Cube: rows =", rows.length, "products =", products.length, "tasks =", allTasks.length);
+
+    console.log("[sync-cube] ===== PROCESSED DATA =====");
+    console.log("[sync-cube] products to upsert:", products.length);
+    console.log("[sync-cube] tasks to insert:", allTasks.length);
+    console.log("[sync-cube] skipped (no id):", skippedNoId);
+    console.log("[sync-cube] skipped (no url):", skippedNoUrl);
+
+    // 按 id 去重，保留最后一条记录
+    console.log("[sync-cube] ===== DEDUPLICATING PRODUCTS =====");
+    const productsMap = new Map<string, Record<string, unknown>>();
+    let duplicateCount = 0;
+    for (const p of products) {
+      const id = p.id as string;
+      if (productsMap.has(id)) {
+        duplicateCount++;
+      }
+      productsMap.set(id, p);
+    }
+    const deduplicatedProducts = Array.from(productsMap.values());
+    console.log("[sync-cube] before dedup:", products.length);
+    console.log("[sync-cube] after dedup:", deduplicatedProducts.length);
+    console.log("[sync-cube] duplicates removed:", duplicateCount);
 
     const BATCH = 200;
-    for (let i = 0; i < products.length; i += BATCH) {
-      const batch = products.slice(i, i + BATCH);
-      await supabase.from("standard_products_tag").upsert(batch, { onConflict: "id" });
+    console.log("[sync-cube] ===== UPSERTING PRODUCTS =====");
+    console.log("[sync-cube] batch size:", BATCH, "total batches:", Math.ceil(deduplicatedProducts.length / BATCH));
+    for (let i = 0; i < deduplicatedProducts.length; i += BATCH) {
+      const batch = deduplicatedProducts.slice(i, i + BATCH);
+      const batchNum = Math.floor(i / BATCH) + 1;
+      console.log(`[sync-cube] upserting batch ${batchNum}/${Math.ceil(deduplicatedProducts.length / BATCH)}, size: ${batch.length}`);
+      const { error } = await supabase.from("standard_products_tag").upsert(batch, { onConflict: "id" });
+      if (error) {
+        console.error(`[sync-cube] batch ${batchNum} upsert error:`, error.message);
+      } else {
+        console.log(`[sync-cube] batch ${batchNum} upserted successfully`);
+      }
     }
 
+    console.log("[sync-cube] ===== INSERTING TASKS =====");
+    console.log("[sync-cube] inserting tasks to aliyun_sync_tasks...");
     let inserted = 0;
-    for (const t of allTasks) {
+    let duplicateSkipped = 0;
+    let errorCount = 0;
+
+    for (let i = 0; i < allTasks.length; i++) {
+      const t = allTasks[i];
       const { error } = await supabase.from("aliyun_sync_tasks").insert(t);
       if (error) {
-        if (error.code === "23505" || /duplicate|unique/i.test(error.message)) continue;
-        console.error("task insert error", t.product_id, t.pic_name, error.message);
-      } else inserted++;
+        if (error.code === "23505" || /duplicate|unique/i.test(error.message)) {
+          duplicateSkipped++;
+        } else {
+          errorCount++;
+          console.error("[sync-cube] task insert error", t.product_id, t.pic_name, error.message);
+        }
+      } else {
+        inserted++;
+        // 每100条打印一次进度
+        if (inserted % 100 === 0) {
+          console.log(`[sync-cube] inserted ${inserted}/${allTasks.length} tasks...`);
+        }
+      }
     }
 
-    const analyzedValues = rows.map((r) => get(r, "analyzed_at")).filter((v): v is string => typeof v === "string");
-    const newCursor = analyzedValues.length > 0 ? analyzedValues.sort().pop()! : lastAnalyzedAt;
+    console.log("[sync-cube] ===== TASK INSERT SUMMARY =====");
+    console.log("[sync-cube] inserted:", inserted);
+    console.log("[sync-cube] duplicate skipped:", duplicateSkipped);
+    console.log("[sync-cube] errors:", errorCount);
+
+    // 更新游标
+    const newCursor = tempMaxAnalyzedAt;
     if (newCursor) {
+      console.log("[sync-cube] ===== UPDATING CURSOR =====");
+      console.log("[sync-cube] old cursor:", lastAnalyzedAt ?? "(none)");
+      console.log("[sync-cube] new cursor:", newCursor);
       await supabase.from("sync_state").upsert(
         { key: cursorKey, value: newCursor, updated_at: new Date().toISOString() },
         { onConflict: "key" }
       );
-      console.log("[sync-cube] cursor updated to", newCursor);
+      console.log("[sync-cube] cursor updated successfully");
     }
-    console.log("[sync-cube] done: products =", products.length, "tasksInserted =", inserted, "tasksTotal =", allTasks.length);
+
+    console.log("[sync-cube] ===== SYNC DONE =====");
+    console.log("[sync-cube] final summary:");
+    console.log("  products (raw):", products.length);
+    console.log("  products (dedup):", deduplicatedProducts.length);
+    console.log("  duplicates removed:", duplicateCount);
+    console.log("  tasks inserted:", inserted);
+    console.log("  tasks total:", allTasks.length);
+    console.log("  cursor:", newCursor);
 
     return jsonResponse({
       ok: true,
-      products: products.length,
+      products: deduplicatedProducts.length,
+      productsRaw: products.length,
+      duplicatesRemoved: duplicateCount,
       tasksInserted: inserted,
       tasksTotal: allTasks.length,
       cursor: newCursor,

@@ -55,6 +55,15 @@ async function callSearchImage(
   token: string,
   input: SearchImageInput
 ): Promise<{ success: boolean; productId: string | null; score: number; message: string; noMatch?: boolean }> {
+  console.log("[search-image-ai-match] SearchImage request:", JSON.stringify({
+    instanceName: input.instanceName,
+    picUrl: input.picUrl.length > 100 ? input.picUrl.slice(0, 97) + "..." : input.picUrl,
+    num: input.num,
+    start: input.start,
+    scoreThreshold: input.scoreThreshold,
+    categoryId: input.categoryId,
+  }));
+
   const res = await fetch(graphqlUrl, {
     method: "POST",
     headers: {
@@ -64,28 +73,45 @@ async function callSearchImage(
     body: JSON.stringify({ query: SEARCH_IMAGE_QUERY, variables: { input } }),
   });
   if (!res.ok) {
-    return { success: false, productId: null, score: 0, message: `HTTP ${res.status}: ${await res.text()}` };
+    const errorText = await res.text();
+    console.error("[search-image-ai-match] SearchImage HTTP error:", res.status, errorText);
+    return { success: false, productId: null, score: 0, message: `HTTP ${res.status}: ${errorText}` };
   }
   const json = (await res.json()) as { data?: SearchImageResult; errors?: unknown[] };
+  console.log("[search-image-ai-match] SearchImage response:", JSON.stringify(json));
+
   if (json.errors?.length) {
+    console.error("[search-image-ai-match] SearchImage GraphQL errors:", JSON.stringify(json.errors));
     return { success: false, productId: null, score: 0, message: JSON.stringify(json.errors) };
   }
   const searchImage = json.data?.ali?.searchImage;
   if (!searchImage) {
+    console.error("[search-image-ai-match] SearchImage no searchImage in response, data:", JSON.stringify(json.data));
     return { success: false, productId: null, score: 0, message: "No searchImage in response" };
   }
   if (!searchImage.Success) {
+    console.error("[search-image-ai-match] SearchImage Success=false, searchImage:", JSON.stringify(searchImage));
     return { success: false, productId: null, score: 0, message: "SearchImage Success=false" };
   }
+
   const auctions = searchImage.Auctions ?? [];
+  console.log("[search-image-ai-match] SearchImage auctions count:", auctions.length);
+
   if (auctions.length === 0) {
+    console.log("[search-image-ai-match] SearchImage no auctions (no match), PicInfo:", JSON.stringify(searchImage.PicInfo));
     return { success: true, productId: null, score: 0, message: "no_match", noMatch: true };
   }
+
   const top = auctions[0];
+  console.log("[search-image-ai-match] SearchImage top result:", JSON.stringify(top));
+
   if (!top || top.ProductId == null || top.ProductId === "") {
+    console.log("[search-image-ai-match] SearchImage top result has no ProductId");
     return { success: true, productId: null, score: 0, message: "no_match", noMatch: true };
   }
+
   const score = typeof top.Score === "number" ? Math.max(0, Math.min(1, top.Score)) : 0;
+  console.log("[search-image-ai-match] SearchImage matched: ProductId =", top.ProductId, "Score =", score);
   return { success: true, productId: String(top.ProductId), score, message: "" };
 }
 
@@ -144,7 +170,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: rows, error: fetchError } = await supabase
       .from("ai_match")
-      .select("id, crop_image, category_id")
+      .select("id, crop_image, category_id, source_table, stored_url")
       .not("crop_image", "is", null)
       .is("standard_product_id", null)
       .or(`last_search_at.is.null,last_search_at.lt.${retryAfter}`)
@@ -173,11 +199,22 @@ Deno.serve(async (req: Request) => {
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const categoryId =
-        row.category_id != null && row.category_id !== ""
-          ? parseInt(String(row.category_id), 10)
-          : undefined;
-      const picUrl = row.crop_image ?? "";
+
+      // 详细打印品类信息
+      const rawCategoryId = row.category_id;
+      let categoryId: number | undefined;
+      let categoryInfo = "";
+      if (rawCategoryId != null && rawCategoryId !== "") {
+        categoryId = parseInt(String(rawCategoryId), 10);
+        categoryInfo = `raw="${rawCategoryId}" parsed=${categoryId}`;
+      } else {
+        categoryInfo = "undefined (will search all categories)";
+      }
+
+      // source_table 为 ods_ecommerce 时使用 stored_url 进行图搜，否则使用 crop_image
+      const picUrl = row.source_table === "ods_ecommerce"
+        ? (row.stored_url ?? row.crop_image ?? "")
+        : (row.crop_image ?? "");
       const picUrlShort = picUrl.length > 80 ? picUrl.slice(0, 77) + "..." : picUrl;
       console.log(
         "[search-image-ai-match] task",
@@ -186,15 +223,23 @@ Deno.serve(async (req: Request) => {
         rows.length,
         "id =",
         row.id,
+        "source_table =",
+        row.source_table ?? "(null)",
         "category_id =",
-        row.category_id ?? "(all)",
+        rawCategoryId ?? "(null)",
+        `(${categoryInfo})`,
         "picUrl =",
         picUrlShort
       );
 
+      // source_table 为 ods_ecommerce 时使用 stored_url 进行图搜，否则使用 crop_image
+      const searchPicUrl = row.source_table === "ods_ecommerce"
+        ? (row.stored_url ?? row.crop_image ?? "")
+        : (row.crop_image ?? "");
+
       const input: SearchImageInput = {
         instanceName,
-        picUrl: row.crop_image!,
+        picUrl: searchPicUrl,
         num: 1,
         start: 0,
         scoreThreshold,
@@ -210,8 +255,13 @@ Deno.serve(async (req: Request) => {
           .update({ standard_product_id: productId, confidence: score })
           .eq("id", row.id);
         if (error) {
-          failed++;
-          console.error("[search-image-ai-match] update failed", row.id, error.message);
+          // 检查是否是唯一键冲突
+          if (error.message.includes("unique constraint") || error.message.includes("duplicate key")) {
+            console.log("[search-image-ai-match] skip duplicate (source_table+source_id+standard_product_id already exists)", row.id);
+          } else {
+            failed++;
+            console.error("[search-image-ai-match] update failed", row.id, error.message);
+          }
         } else {
           matched++;
           console.log("[search-image-ai-match] row updated", row.id, "-> standard_product_id =", productId, "confidence =", score);

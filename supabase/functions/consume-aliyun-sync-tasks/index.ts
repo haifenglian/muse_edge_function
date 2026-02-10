@@ -42,6 +42,7 @@ type AddImageInput = {
   picName: string;
   picUrl: string;
   customContent: string | null;
+  categoryId?: number;
 };
 
 type AddImageResult = {
@@ -119,7 +120,7 @@ Deno.serve(async (req: Request) => {
     }
     const graphqlUrl = (Deno.env.get("ALIYUN_GRAPHQL_URL") ?? "https://hasura-auth-worker.data-d1a.workers.dev/").replace(/\/$/, "");
     const instanceName = Deno.env.get("INSTANCE_NAME") ?? "muse";
-    const batchSize = Math.min(100, Math.max(1, parseInt(Deno.env.get("BATCH_SIZE") ?? "25", 10)));
+    const batchSize = Math.min(100, Math.max(1, parseInt(Deno.env.get("BATCH_SIZE") ?? "10", 10)));
 
     // GET：仅返回 pending 数量
     if (req.method === "GET") {
@@ -141,7 +142,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: rows, error: fetchError } = await supabase
       .from("aliyun_sync_tasks")
-      .select("id, product_id, pic_url, pic_name, custom_content, retry_count, max_retries")
+      .select("id, product_id, category_id, pic_url, pic_name, custom_content, retry_count, max_retries")
       .eq("status", "pending")
       .order("created_at", { ascending: true })
       .limit(batchSize * 2);
@@ -192,6 +193,7 @@ Deno.serve(async (req: Request) => {
         picName: t.pic_name,
         picUrl: t.pic_url,
         customContent: t.custom_content ?? "",
+        ...(t.category_id != null ? { categoryId: t.category_id } : {}),
       };
       console.log("[consume-aliyun] AddImage request:", JSON.stringify(input));
       const { success, message } = await callAddImage(

@@ -42,8 +42,10 @@ function get(row: Record<string, unknown>, key: string): unknown {
 }
 
 function rowToTask(row: Record<string, unknown>): Record<string, unknown> | null {
+  const id = get(row, "id");
   const productId = get(row, "product_id");
   const productName = get(row, "product_name");
+  const sourceName = get(row, "source_name");
   const storedUrl = get(row, "stored_url");
   const position = get(row, "position");
 
@@ -55,8 +57,10 @@ function rowToTask(row: Record<string, unknown>): Record<string, unknown> | null
 
   const pos = typeof position === "number" && !Number.isNaN(position) ? Math.floor(position) : 0;
   return {
+    source_id: id != null ? String(id) : null,
     product_id: String(productId),
     product_name: productName != null ? String(productName) : null,
+    source_name: sourceName != null ? String(sourceName) : null,
     image_url: url,
     position: pos,
     status: "pending",
