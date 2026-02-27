@@ -144,23 +144,26 @@ Deno.serve(async (req: Request) => {
     const instanceName = Deno.env.get("INSTANCE_NAME") ?? "muse";
     const batchSize = Math.min(50, Math.max(1, parseInt(Deno.env.get("BATCH_SIZE") ?? "25", 10)));
     const scoreThreshold = Deno.env.get("SCORE_THRESHOLD") ?? "0.0";
+    const maxRetries = parseInt(Deno.env.get("MAX_SEARCH_RETRIES") ?? "3", 10);
 
     const NO_MATCH_RETRY_HOURS = 1;
     const retryAfter = new Date(Date.now() - NO_MATCH_RETRY_HOURS * 60 * 60 * 1000).toISOString();
 
-    // GET：仅返回待匹配数量（含「未搜过或距上次 no match 超过 1 小时」）
+    // GET：仅返回待匹配数量（含「未搜过或距上次 no match 超过 1 小时」且「重试次数未达上限」）
     if (req.method === "GET") {
       const { count, error } = await supabase
         .from("ai_match")
         .select("id", { count: "exact", head: true })
         .not("crop_image", "is", null)
         .is("standard_product_id", null)
+        .lt("search_retry_count", maxRetries)
         .or(`last_search_at.is.null,last_search_at.lt.${retryAfter}`);
       if (error) return jsonResponse({ ok: false, error: error.message }, 500);
       return jsonResponse({
         ok: true,
         pending: count ?? 0,
-        message: "POST 触发一次图搜匹配（按 5 QPS 调用 SearchImage）；no match 行 1 小时内不再重试",
+        maxRetries,
+        message: `POST 触发一次图搜匹配（按 5 QPS 调用 SearchImage）；no match 行 1 小时内不再重试；失败行重试 ${maxRetries} 次后不再重试`,
       });
     }
 
@@ -170,9 +173,10 @@ Deno.serve(async (req: Request) => {
 
     const { data: rows, error: fetchError } = await supabase
       .from("ai_match")
-      .select("id, crop_image, category_id, source_table, stored_url")
+      .select("id, crop_image, category_id, source_table, stored_url, search_retry_count")
       .not("crop_image", "is", null)
       .is("standard_product_id", null)
+      .lt("search_retry_count", maxRetries)
       .or(`last_search_at.is.null,last_search_at.lt.${retryAfter}`)
       .order("create_time", { ascending: true, nullsFirst: false })
       .limit(batchSize);
@@ -252,12 +256,26 @@ Deno.serve(async (req: Request) => {
         console.log("[search-image-ai-match] SearchImage ok, productId =", productId, "score =", score);
         const { error } = await supabase
           .from("ai_match")
-          .update({ standard_product_id: productId, confidence: score })
+          .update({
+            standard_product_id: productId,
+            confidence: score,
+            search_error_message: null,
+          })
           .eq("id", row.id);
         if (error) {
+          // 打印完整错误信息用于诊断
+          console.error("[search-image-ai-match] update error details:", JSON.stringify(error));
           // 检查是否是唯一键冲突
           if (error.message.includes("unique constraint") || error.message.includes("duplicate key")) {
-            console.log("[search-image-ai-match] skip duplicate (source_table+source_id+standard_product_id already exists)", row.id);
+            // 唯一键冲突：说明相同 source_id 的另一条记录已经匹配到这个产品
+            // 更新 last_search_at 和 search_retry_count，避免无限重试
+            const now = new Date().toISOString();
+            await supabase.from("ai_match").update({
+              last_search_at: now,
+              search_retry_count: (row.search_retry_count ?? 0) + 1,
+              search_error_message: `duplicate: ${error.message}`,
+            }).eq("id", row.id);
+            console.log("[search-image-ai-match] skip duplicate, 已更新重试信息", row.id);
           } else {
             failed++;
             console.error("[search-image-ai-match] update failed", row.id, error.message);
@@ -269,11 +287,21 @@ Deno.serve(async (req: Request) => {
       } else if (success && isNoMatch) {
         noMatch++;
         const now = new Date().toISOString();
-        await supabase.from("ai_match").update({ last_search_at: now }).eq("id", row.id);
+        await supabase.from("ai_match").update({
+          last_search_at: now,
+          search_retry_count: (row.search_retry_count ?? 0) + 1,
+          search_error_message: null,
+        }).eq("id", row.id);
         console.log("[search-image-ai-match] no match (图库无结果或未入图)，已写 last_search_at，1 小时内不再重试", row.id);
       } else {
         failed++;
-        console.error("[search-image-ai-match] search failed", row.id, message || "unknown");
+        const now = new Date().toISOString();
+        await supabase.from("ai_match").update({
+          last_search_at: now,
+          search_retry_count: (row.search_retry_count ?? 0) + 1,
+          search_error_message: message?.slice(0, 500) || "unknown",
+        }).eq("id", row.id);
+        console.error("[search-image-ai-match] search failed", row.id, message || "unknown", "已写 last_search_at 和 search_error_message");
       }
 
       await sleep(DELAY_MS);
