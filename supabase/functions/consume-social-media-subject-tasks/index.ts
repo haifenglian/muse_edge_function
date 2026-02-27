@@ -244,6 +244,8 @@ Deno.serve(async (req: Request) => {
         const aiMatchData = {
           crop_image: cropImage,
           category_id: category,
+          standard_product_id: null, // 待图搜匹配
+          confidence: 0,
           source_table: SOURCE_TABLE,
           source_id: sourceId,
           source_name: sourceName,
@@ -253,12 +255,11 @@ Deno.serve(async (req: Request) => {
         };
 
         // 使用 upsert，避免重复插入
-        // onConflict 指定唯一约束，只更新未匹配的记录
+        // onConflict 使用列名（PostgreSQL 会自动找到对应的唯一约束）
         const { error: upsertError } = await supabase
           .from("ai_match")
           .upsert(aiMatchData, {
             onConflict: "source_table,source_id,image_index,detection_index",
-            ignoreDuplicates: false,
           })
           .is("standard_product_id", null);  // ← 只更新未匹配的记录，保护已匹配结果
 
