@@ -54,7 +54,7 @@ async function callSearchImage(
   graphqlUrl: string,
   token: string,
   input: SearchImageInput
-): Promise<{ success: boolean; productId: string | null; score: number; message: string; noMatch?: boolean }> {
+): Promise<{ success: boolean; productId: string | null; score: number; message: string; noMatch?: boolean; customContent?: string | null }> {
   console.log("[search-image-ai-match] SearchImage request:", JSON.stringify({
     instanceName: input.instanceName,
     picUrl: input.picUrl.length > 100 ? input.picUrl.slice(0, 97) + "..." : input.picUrl,
@@ -111,8 +111,8 @@ async function callSearchImage(
   }
 
   const score = typeof top.Score === "number" ? Math.max(0, Math.min(1, top.Score)) : 0;
-  console.log("[search-image-ai-match] SearchImage matched: ProductId =", top.ProductId, "Score =", score);
-  return { success: true, productId: String(top.ProductId), score, message: "" };
+  console.log("[search-image-ai-match] SearchImage matched: ProductId =", top.ProductId, "Score =", score, "CustomContent =", top.CustomContent);
+  return { success: true, productId: String(top.ProductId), score, message: "", customContent: top.CustomContent ?? null };
 }
 
 function jsonResponse(body: Record<string, unknown>, status = 200) {
@@ -254,12 +254,21 @@ Deno.serve(async (req: Request) => {
 
       if (success && productId != null && productId !== "") {
         console.log("[search-image-ai-match] SearchImage ok, productId =", productId, "score =", score);
+        let standardProductPicUrl: string | null = null;
+        try {
+          const cc = result.customContent;
+          if (cc) {
+            const parsed = JSON.parse(cc);
+            standardProductPicUrl = parsed?.pic_url ?? null;
+          }
+        } catch { /**/ }
         const { error } = await supabase
           .from("ai_match")
           .update({
             standard_product_id: productId,
             confidence: score,
             search_error_message: null,
+            ...(standardProductPicUrl != null ? { standard_product_pic_url: standardProductPicUrl } : {}),
           })
           .eq("id", row.id);
         if (error) {

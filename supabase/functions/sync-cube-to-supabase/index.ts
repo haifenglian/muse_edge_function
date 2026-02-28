@@ -39,6 +39,13 @@ function get(row: Record<string, unknown>, key: string): unknown {
   return row[PREFIX + key] ?? row[key];
 }
 
+/** 对 URL 做简单 djb2 hash，返回 8 位 hex，用于生成稳定的 pic_name 后缀 */
+function shortHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(16).padStart(8, "0");
+}
+
 /** stored_url 为字符串类型 URL，转为 [url] 以兼容下游（产品表 resaved_image_path 为数组） */
 function parseStoredUrl(v: unknown): string[] {
   if (v == null) return [];
@@ -74,13 +81,14 @@ function expandTasks(
   resavedImagePath: string[]
 ): Array<Record<string, unknown>> {
   const tasks: Array<Record<string, unknown>> = [];
-  resavedImagePath.forEach((url, i) => {
+  resavedImagePath.forEach((url) => {
     if (!url?.trim()) return;
+    const trimmedUrl = url.trim();
     tasks.push({
       product_id: productId,
       category_id: categoryId,
-      pic_url: url.trim(),
-      pic_name: `${productId}_${i}`,
+      pic_url: trimmedUrl,
+      pic_name: `${productId}_${shortHash(trimmedUrl)}`,
       custom_content: dimensionsStr,
       status: "pending",
     });
@@ -117,12 +125,21 @@ async function fetchCubeIncremental(
 ): Promise<Record<string, unknown>[]> {
   const all: Record<string, unknown>[] = [];
   let offset = 0;
+  let pageCount = 0;
   const url = `${baseUrl.replace(/\/$/, "")}/load`;
+  console.log("[sync-cube] ===== CUBE FETCH START =====");
+  console.log("[sync-cube] sinceAnalyzedAt:", sinceAnalyzedAt ?? "(full sync)");
+  console.log("[sync-cube] pageSize:", pageSize, "maxRows:", maxRows ?? "no limit");
+
   for (;;) {
+    pageCount++;
     let limit = pageSize;
     if (maxRows != null) {
       const remaining = maxRows - all.length;
-      if (remaining <= 0) break;
+      if (remaining <= 0) {
+        console.log("[sync-cube] reached maxRows limit, stopping fetch");
+        break;
+      }
       limit = Math.min(limit, remaining);
     }
     const query: Record<string, unknown> = {
@@ -143,6 +160,9 @@ async function fetchCubeIncremental(
         values: [sinceAnalyzedAt],
       });
     }
+
+    console.log(`[sync-cube] [Page ${pageCount}] Fetching: limit=${limit}, offset=${offset}`);
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -157,11 +177,30 @@ async function fetchCubeIncremental(
     }
     const data = (await res.json()) as { data?: Record<string, unknown>[] };
     const rows = data.data ?? [];
+
+    console.log(`[sync-cube] [Page ${pageCount}] Fetched: ${rows.length} rows (total so far: ${all.length + rows.length})`);
+
+    if (rows.length > 0) {
+      const firstAnalyzedAt = rows[0][`${CUBE_VIEW}.analyzed_at`];
+      const lastAnalyzedAt = rows[rows.length - 1][`${CUBE_VIEW}.analyzed_at`];
+      console.log(`[sync-cube] [Page ${pageCount}] Time range: ${firstAnalyzedAt} to ${lastAnalyzedAt}`);
+    }
+
     all.push(...rows);
-    if (rows.length < limit) break;
+    if (rows.length < limit) {
+      console.log(`[sync-cube] [Page ${pageCount}] No more data (rows.length ${rows.length} < limit ${limit})`);
+      break;
+    }
     offset += rows.length;
-    if (maxRows != null && all.length >= maxRows) break;
+    if (maxRows != null && all.length >= maxRows) {
+      console.log(`[sync-cube] [Page ${pageCount}] Reached maxRows ${maxRows}`);
+      break;
+    }
   }
+
+  console.log("[sync-cube] ===== CUBE FETCH DONE =====");
+  console.log(`[sync-cube] Total pages: ${pageCount}`);
+  console.log(`[sync-cube] Total rows fetched: ${all.length}`);
   return all;
 }
 
@@ -208,9 +247,9 @@ Deno.serve(async (req: Request) => {
     const pageSizeParam = url.searchParams.get("page_size");
     const maxRowsParam = url.searchParams.get("max_rows");
     const pageSize = pageSizeParam ? parseInt(pageSizeParam, 10) : parseInt(Deno.env.get("CUBE_PAGE_SIZE") ?? "5000", 10);
-    // 默认每次最多处理 500 条，可通过查询参数或环境变量覆盖
+    // 默认每次最多处理 10000 条，可通过查询参数或环境变量覆盖
     const maxRowsEnv = maxRowsParam ?? Deno.env.get("CUBE_MAX_ROWS");
-    const maxRows = maxRowsEnv ? parseInt(String(maxRowsEnv), 10) : 500;
+    const maxRows = maxRowsEnv ? parseInt(String(maxRowsEnv), 10) : 10000;
 
     const cubeBase = Deno.env.get("CUBE_BASE_URL") ?? "https://combative-keene.gcp-us-central1.cubecloudapp.dev/cubejs-api/v1";
     const cubeSecret = Deno.env.get("CUBE_API_SECRET") ?? "032dcfacaccab8449281b8c6351ec58844c1179630392a34d2adc40aa420b061";
@@ -309,33 +348,38 @@ Deno.serve(async (req: Request) => {
 
     console.log("[sync-cube] ===== INSERTING TASKS =====");
     console.log("[sync-cube] inserting tasks to aliyun_sync_tasks...");
-    let inserted = 0;
-    let duplicateSkipped = 0;
-    let errorCount = 0;
+    console.log("[sync-cube] total tasks:", allTasks.length);
 
-    for (let i = 0; i < allTasks.length; i++) {
-      const t = allTasks[i];
-      const { error } = await supabase.from("aliyun_sync_tasks").insert(t);
+    // 批量插入，每次 1000 条
+    const TASK_BATCH_SIZE = 1000;
+    let totalInserted = 0;
+    let totalDuplicateSkipped = 0;
+
+    for (let i = 0; i < allTasks.length; i += TASK_BATCH_SIZE) {
+      const batch = allTasks.slice(i, i + TASK_BATCH_SIZE);
+      const batchNum = Math.floor(i / TASK_BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(allTasks.length / TASK_BATCH_SIZE);
+
+      console.log(`[sync-cube] inserting batch ${batchNum}/${totalBatches}, size: ${batch.length}`);
+
+      const { error } = await supabase.from("aliyun_sync_tasks").upsert(batch, {
+        onConflict: "product_id,pic_url",
+        ignoreDuplicates: true,
+      });
+
       if (error) {
-        if (error.code === "23505" || /duplicate|unique/i.test(error.message)) {
-          duplicateSkipped++;
-        } else {
-          errorCount++;
-          console.error("[sync-cube] task insert error", t.product_id, t.pic_name, error.message);
-        }
+        // 如果仍然失败，记录错误但继续处理下一批
+        console.error(`[sync-cube] batch ${batchNum} insert failed:`, error.message);
       } else {
-        inserted++;
-        // 每100条打印一次进度
-        if (inserted % 100 === 0) {
-          console.log(`[sync-cube] inserted ${inserted}/${allTasks.length} tasks...`);
-        }
+        totalInserted += batch.length;
+        console.log(`[sync-cube] batch ${batchNum} inserted successfully (${totalInserted}/${allTasks.length} total)`);
       }
     }
 
     console.log("[sync-cube] ===== TASK INSERT SUMMARY =====");
-    console.log("[sync-cube] inserted:", inserted);
-    console.log("[sync-cube] duplicate skipped:", duplicateSkipped);
-    console.log("[sync-cube] errors:", errorCount);
+    console.log("[sync-cube] total tasks:", allTasks.length);
+    console.log("[sync-cube] inserted:", totalInserted);
+    console.log("[sync-cube] duplicate skipped:", totalDuplicateSkipped);
 
     // 更新游标
     const newCursor = tempMaxAnalyzedAt;
@@ -343,11 +387,21 @@ Deno.serve(async (req: Request) => {
       console.log("[sync-cube] ===== UPDATING CURSOR =====");
       console.log("[sync-cube] old cursor:", lastAnalyzedAt ?? "(none)");
       console.log("[sync-cube] new cursor:", newCursor);
-      await supabase.from("sync_state").upsert(
+      const { error: cursorError } = await supabase.from("sync_state").upsert(
         { key: cursorKey, value: newCursor, updated_at: new Date().toISOString() },
         { onConflict: "key" }
       );
-      console.log("[sync-cube] cursor updated successfully");
+      if (cursorError) {
+        console.error("[sync-cube] cursor update FAILED:", cursorError.message);
+        console.error("[sync-cube] cursor error details:", JSON.stringify(cursorError));
+      } else {
+        console.log("[sync-cube] cursor updated successfully");
+      }
+    } else {
+      console.warn("[sync-cube] ===== SKIPPING CURSOR UPDATE =====");
+      console.warn("[sync-cube] newCursor is null, no cursor update will happen");
+      console.warn("[sync-cube] tempMaxAnalyzedAt:", tempMaxAnalyzedAt);
+      console.warn("[sync-cube] analyzedValues:", analyzedValues);
     }
 
     console.log("[sync-cube] ===== SYNC DONE =====");
@@ -355,7 +409,7 @@ Deno.serve(async (req: Request) => {
     console.log("  products (raw):", products.length);
     console.log("  products (dedup):", deduplicatedProducts.length);
     console.log("  duplicates removed:", duplicateCount);
-    console.log("  tasks inserted:", inserted);
+    console.log("  tasks inserted:", totalInserted);
     console.log("  tasks total:", allTasks.length);
     console.log("  cursor:", newCursor);
 
@@ -364,7 +418,7 @@ Deno.serve(async (req: Request) => {
       products: deduplicatedProducts.length,
       productsRaw: products.length,
       duplicatesRemoved: duplicateCount,
-      tasksInserted: inserted,
+      tasksInserted: totalInserted,
       tasksTotal: allTasks.length,
       cursor: newCursor,
       last_analyzed_at: newCursor,

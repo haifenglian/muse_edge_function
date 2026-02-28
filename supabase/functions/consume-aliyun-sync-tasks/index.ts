@@ -192,7 +192,11 @@ Deno.serve(async (req: Request) => {
         productId: t.product_id,
         picName: t.pic_name,
         picUrl: t.pic_url,
-        customContent: t.custom_content ?? "",
+        customContent: (() => {
+          let base: Record<string, unknown> = {};
+          try { if (t.custom_content) base = JSON.parse(t.custom_content); } catch { /**/ }
+          return JSON.stringify({ ...base, product_id: t.product_id, pic_url: t.pic_url });
+        })(),
         ...(t.category_id != null ? { categoryId: t.category_id } : {}),
       };
       console.log("[consume-aliyun] AddImage request:", JSON.stringify(input));
