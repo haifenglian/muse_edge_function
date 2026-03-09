@@ -37,6 +37,7 @@ type SearchImageInput = {
   start: number;
   scoreThreshold?: string;
   categoryId?: number;
+  crop?: boolean;
 };
 
 type SearchImageResult = {
@@ -171,7 +172,14 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ok: false, error: "仅支持 GET 与 POST" }, 405);
     }
 
-    const { data: rows, error: fetchError } = await supabase
+    // 从 body 中解析可选的 source_table 过滤参数
+    let sourceTableFilter: string | null = null;
+    try {
+      const body = await req.json();
+      sourceTableFilter = body?.source_table ?? null;
+    } catch { /* body 为空或非 JSON，忽略 */ }
+
+    let rowsQuery = supabase
       .from("ai_match")
       .select("id, crop_image, category_id, source_table, stored_url, search_retry_count")
       .not("crop_image", "is", null)
@@ -180,6 +188,8 @@ Deno.serve(async (req: Request) => {
       .or(`last_search_at.is.null,last_search_at.lt.${retryAfter}`)
       .order("create_time", { ascending: true, nullsFirst: false })
       .limit(batchSize);
+    if (sourceTableFilter) rowsQuery = rowsQuery.eq("source_table", sourceTableFilter);
+    const { data: rows, error: fetchError } = await rowsQuery;
 
     if (fetchError) {
       return jsonResponse({ ok: false, error: fetchError.message }, 500);
@@ -247,6 +257,7 @@ Deno.serve(async (req: Request) => {
         num: 1,
         start: 0,
         scoreThreshold,
+        crop: false,
         ...(Number.isInteger(categoryId) ? { categoryId } : {}),
       };
       const result = await callSearchImage(graphqlUrl, token, input);
